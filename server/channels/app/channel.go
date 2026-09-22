@@ -2883,12 +2883,20 @@ func (a *App) postRemoveFromChannelMessage(rctx request.CTX, removerUserId strin
 // removeChannelMembership strips a user's channel membership and the associated
 // thread memberships. Keeping these together ensures channel access cannot be
 // revoked without also dropping the thread state that depends on it.
+//
+// The thread memberships are removed first, on purpose. The two writes are not
+// transactional, so if the second one fails the caller (or a later retry) must
+// be able to reach a consistent state again. With this ordering a partial
+// failure leaves the ChannelMembers row in place, so the normal removal path
+// still sees the user as a member and can be retried; the reverse ordering
+// would leave orphaned thread state that the membership-gated removal paths
+// could never clean up because they would report the user as already gone.
 func (a *App) removeChannelMembership(rctx request.CTX, userID, channelID, caller string) *model.AppError {
-	if err := a.Srv().Store().Channel().RemoveMember(rctx, channelID, userID); err != nil {
-		return model.NewAppError(caller, "app.channel.remove_member.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
-	}
 	if err := a.Srv().Store().Thread().DeleteMembershipsForChannel(userID, channelID); err != nil {
 		return model.NewAppError(caller, model.NoTranslation, nil, "failed to delete threadmemberships upon leaving channel", http.StatusInternalServerError).Wrap(err)
+	}
+	if err := a.Srv().Store().Channel().RemoveMember(rctx, channelID, userID); err != nil {
+		return model.NewAppError(caller, "app.channel.remove_member.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 	return nil
 }
@@ -3661,10 +3669,50 @@ func (a *App) PermanentDeleteChannel(rctx request.CTX, channel *model.Channel) *
 	return nil
 }
 
+// RemoveAllDeactivatedMembersFromChannel removes every deactivated user from
+// the channel. Each user goes through the same removeChannelMembership helper
+// as a regular removal so that thread memberships and the per-user channel
+// membership caches are dropped together with the ChannelMembers row; a bulk
+// DELETE of ChannelMembers alone would leave thread/unread state and cached
+// permission lookups disagreeing with channel access. The operation is
+// idempotent: a repeated call simply finds nothing left to remove.
 func (a *App) RemoveAllDeactivatedMembersFromChannel(rctx request.CTX, channel *model.Channel) *model.AppError {
-	err := a.Srv().Store().Channel().RemoveAllDeactivatedMembers(rctx, channel.Id)
-	if err != nil {
-		return model.NewAppError("RemoveAllDeactivatedMembersFromChannel", "app.channel.remove_all_deactivated_members.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	const perPage = 100
+
+	removed := 0
+	for {
+		// Always fetch page 0: every removal shrinks the result set, so
+		// advancing the offset would skip members.
+		users, err := a.Srv().Store().User().GetProfilesInChannel(&model.UserGetOptions{
+			InChannelId: channel.Id,
+			Inactive:    true,
+			Page:        0,
+			PerPage:     perPage,
+		})
+		if err != nil {
+			return model.NewAppError("RemoveAllDeactivatedMembersFromChannel", "app.channel.remove_all_deactivated_members.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+		if len(users) == 0 {
+			break
+		}
+
+		for _, user := range users {
+			if appErr := a.removeChannelMembership(rctx, user.Id, channel.Id, "RemoveAllDeactivatedMembersFromChannel"); appErr != nil {
+				return appErr
+			}
+			a.Srv().Platform().InvalidateChannelCacheForUser(user.Id)
+			removed++
+		}
+
+		// Every iteration deletes the rows it fetched, so a short page means
+		// there is nothing left to fetch.
+		if len(users) < perPage {
+			break
+		}
+	}
+
+	if removed > 0 {
+		a.invalidateCacheForChannelMembers(channel.Id)
 	}
 
 	return nil

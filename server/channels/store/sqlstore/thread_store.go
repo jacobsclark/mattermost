@@ -70,14 +70,16 @@ func (s *SqlThreadStore) ClearCaches() {
 }
 
 // channelMembershipPredicate filters out ThreadMemberships whose user is no
-// longer a member of the thread's channel. DM/GM threads have an empty
-// ThreadTeamId and are exempt because their access is intrinsic to the
-// channel members.
+// longer a member of the thread's channel.
+//
+// It deliberately applies to every channel type. DM/GM threads have an empty
+// ThreadTeamId, but their members can still be removed (e.g. via
+// SetChannelMembers or shared-channel membership sync), and a user removed
+// from a group message must not be able to observe thread/unread activity
+// any more than a user removed from a private channel can. Legitimate DM/GM
+// members always have a ChannelMembers row, so they are unaffected.
 func channelMembershipPredicate() sq.Sqlizer {
-	return sq.Or{
-		sq.Eq{"Threads.ThreadTeamId": ""},
-		sq.Expr("EXISTS (SELECT 1 FROM ChannelMembers WHERE ChannelMembers.ChannelId = Threads.ChannelId AND ChannelMembers.UserId = ThreadMemberships.UserId)"),
-	}
+	return sq.Expr("EXISTS (SELECT 1 FROM ChannelMembers WHERE ChannelMembers.ChannelId = Threads.ChannelId AND ChannelMembers.UserId = ThreadMemberships.UserId)")
 }
 
 func newSqlThreadStore(sqlStore *SqlStore) store.ThreadStore {

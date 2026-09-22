@@ -109,12 +109,55 @@ func TestRemoveAllDeactivatedMembersFromChannel(t *testing.T) {
 	channelMembers, appErr := th.App.GetChannelMembersPage(th.Context, channel.Id, 0, 10000000)
 	require.Nil(t, appErr)
 	require.Len(t, channelMembers, 2)
+
+	// Give the soon-to-be-deactivated user thread state in the channel so we can
+	// prove it is dropped together with the channel membership.
+	rootPost := th.CreatePost(t, channel)
+	_, _, appErr = th.App.CreatePost(th.Context, &model.Post{
+		UserId:    deactivatedUser.Id,
+		ChannelId: channel.Id,
+		RootId:    rootPost.Id,
+		Message:   "reply",
+	}, channel, model.CreatePostFlags{})
+	require.Nil(t, appErr)
+	appErr = th.App.UpdateThreadFollowForUser(deactivatedUser.Id, team.Id, rootPost.Id, true)
+	require.Nil(t, appErr)
+	_, appErr = th.App.GetThreadMembershipForUser(deactivatedUser.Id, rootPost.Id)
+	require.Nil(t, appErr)
+
 	_, appErr = th.App.UpdateActive(th.Context, deactivatedUser, false)
 	require.Nil(t, appErr)
+
+	// Warm the per-user channel membership cache so the assertion below also
+	// proves the cache is invalidated by the removal.
+	hasPermission, isMember := th.App.HasPermissionToChannel(th.Context, deactivatedUser.Id, channel.Id, model.PermissionReadChannelContent)
+	require.True(t, hasPermission)
+	require.True(t, isMember)
 
 	appErr = th.App.RemoveAllDeactivatedMembersFromChannel(th.Context, channel)
 	require.Nil(t, appErr)
 
+	channelMembers, appErr = th.App.GetChannelMembersPage(th.Context, channel.Id, 0, 10000000)
+	require.Nil(t, appErr)
+	require.Len(t, channelMembers, 1)
+	require.Equal(t, th.BasicUser.Id, channelMembers[0].UserId)
+
+	// Thread state, channel permission and the cached membership lookup must
+	// all agree that the user is gone.
+	_, appErr = th.App.GetThreadMembershipForUser(deactivatedUser.Id, rootPost.Id)
+	require.NotNil(t, appErr)
+	require.Equal(t, http.StatusNotFound, appErr.StatusCode)
+	hasPermission, isMember = th.App.HasPermissionToChannel(th.Context, deactivatedUser.Id, channel.Id, model.PermissionReadChannelContent)
+	require.False(t, hasPermission)
+	require.False(t, isMember)
+
+	// The remaining member keeps their own membership and thread state.
+	_, appErr = th.App.GetThreadMembershipForUser(th.BasicUser.Id, rootPost.Id)
+	require.Nil(t, appErr)
+
+	// Repeating the removal is a no-op rather than an error.
+	appErr = th.App.RemoveAllDeactivatedMembersFromChannel(th.Context, channel)
+	require.Nil(t, appErr)
 	channelMembers, appErr = th.App.GetChannelMembersPage(th.Context, channel.Id, 0, 10000000)
 	require.Nil(t, appErr)
 	require.Len(t, channelMembers, 1)
@@ -4091,4 +4134,181 @@ func TestPatchChannelDefaultCategoryReapplyIsIdempotent(t *testing.T) {
 			assert.Equal(t, 1, count, "channel should appear exactly once in the default category")
 		}
 	}
+}
+
+// TestRemoveUserFromChannelClearsThreadState proves that removing a user from a
+// private channel or a group message makes every backend path agree: channel
+// permission, thread membership, thread list/unread counts, thread follower
+// fanout and post read authorization all deny the removed user, while the
+// remaining members keep their thread state and keep receiving updates.
+func TestRemoveUserFromChannelClearsThreadState(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	th.App.UpdateConfig(func(cfg *model.Config) {
+		*cfg.ServiceSettings.ThreadAutoFollow = true
+		*cfg.ServiceSettings.CollapsedThreads = model.CollapsedThreadsDefaultOn
+	})
+
+	removedUser := th.CreateUser(t)
+	th.LinkUserToTeam(t, removedUser, th.BasicTeam)
+	defer func() {
+		appErr := th.App.PermanentDeleteUser(th.Context, removedUser)
+		require.Nil(t, appErr)
+	}()
+
+	removedSession := model.Session{UserId: removedUser.Id, Roles: model.SystemUserRoleId}
+	remainingSession := model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}
+
+	reply := func(t *testing.T, channel *model.Channel, rootID, userID, message string) *model.Post {
+		t.Helper()
+		post, _, appErr := th.App.CreatePost(th.Context, &model.Post{
+			UserId:    userID,
+			ChannelId: channel.Id,
+			RootId:    rootID,
+			Message:   message,
+		}, channel, model.CreatePostFlags{})
+		require.Nil(t, appErr)
+		return post
+	}
+
+	threadIDs := func(threads *model.Threads) []string {
+		ids := make([]string, 0, len(threads.Threads))
+		for _, thread := range threads.Threads {
+			ids = append(ids, thread.PostId)
+		}
+		return ids
+	}
+
+	runScenario := func(t *testing.T, channel *model.Channel, canReAdd bool) {
+		// removedUser participates in a thread, and a further reply from
+		// BasicUser2 leaves it unread for everyone else.
+		rootPost := th.CreatePost(t, channel)
+		reply(t, channel, rootPost.Id, removedUser.Id, "reply from the user who will be removed")
+		reply(t, channel, rootPost.Id, th.BasicUser2.Id, "reply that is unread for the others")
+
+		// Preconditions: everything agrees the user is a member with thread state.
+		_, appErr := th.App.GetThreadMembershipForUser(removedUser.Id, rootPost.Id)
+		require.Nil(t, appErr)
+		threads, appErr := th.App.GetThreadsForUser(th.Context, removedUser.Id, th.BasicTeam.Id, model.GetUserThreadsOpts{})
+		require.Nil(t, appErr)
+		require.Contains(t, threadIDs(threads), rootPost.Id)
+		hasPermission, isMember := th.App.HasPermissionToChannel(th.Context, removedUser.Id, channel.Id, model.PermissionReadChannelContent)
+		require.True(t, hasPermission)
+		require.True(t, isMember)
+		ok, _ := th.App.SessionHasPermissionToReadPost(th.Context, removedSession, rootPost.Id)
+		require.True(t, ok)
+		_, appErr = th.App.GetChannelUnread(th.Context, channel.Id, removedUser.Id)
+		require.Nil(t, appErr)
+		followers, err := th.App.Srv().Store().Thread().GetThreadFollowers(rootPost.Id, true)
+		require.NoError(t, err)
+		require.Contains(t, followers, removedUser.Id)
+
+		appErr = th.App.RemoveUserFromChannel(th.Context, removedUser.Id, th.BasicUser.Id, channel)
+		require.Nil(t, appErr)
+
+		t.Run("removed user is denied on every path", func(t *testing.T) {
+			hasPermission, isMember := th.App.HasPermissionToChannel(th.Context, removedUser.Id, channel.Id, model.PermissionReadChannelContent)
+			require.False(t, hasPermission)
+			require.False(t, isMember)
+
+			ok, _ := th.App.SessionHasPermissionToReadPost(th.Context, removedSession, rootPost.Id)
+			require.False(t, ok)
+
+			_, appErr := th.App.GetThreadMembershipForUser(removedUser.Id, rootPost.Id)
+			require.NotNil(t, appErr)
+			require.Equal(t, http.StatusNotFound, appErr.StatusCode)
+
+			threads, appErr := th.App.GetThreadsForUser(th.Context, removedUser.Id, th.BasicTeam.Id, model.GetUserThreadsOpts{})
+			require.Nil(t, appErr)
+			require.NotContains(t, threadIDs(threads), rootPost.Id)
+			require.Zero(t, threads.Total)
+			require.Zero(t, threads.TotalUnreadThreads)
+			require.Zero(t, threads.TotalUnreadMentions)
+
+			_, appErr = th.App.GetChannelUnread(th.Context, channel.Id, removedUser.Id)
+			require.NotNil(t, appErr)
+
+			followers, err := th.App.Srv().Store().Thread().GetThreadFollowers(rootPost.Id, true)
+			require.NoError(t, err)
+			require.NotContains(t, followers, removedUser.Id)
+		})
+
+		t.Run("remaining members keep their thread and unread state", func(t *testing.T) {
+			membership, appErr := th.App.GetThreadMembershipForUser(th.BasicUser.Id, rootPost.Id)
+			require.Nil(t, appErr)
+			require.True(t, membership.Following)
+
+			thread, appErr := th.App.GetThreadForUser(th.Context, membership, false)
+			require.Nil(t, appErr)
+			require.EqualValues(t, 2, thread.UnreadReplies)
+
+			ok, isMember := th.App.SessionHasPermissionToReadPost(th.Context, remainingSession, rootPost.Id)
+			require.True(t, ok)
+			require.True(t, isMember)
+
+			// A new reply still reaches the remaining followers, and only them.
+			reply(t, channel, rootPost.Id, th.BasicUser2.Id, "reply after the removal")
+			thread, appErr = th.App.GetThreadForUser(th.Context, membership, false)
+			require.Nil(t, appErr)
+			require.EqualValues(t, 3, thread.UnreadReplies)
+
+			followers, err := th.App.Srv().Store().Thread().GetThreadFollowers(rootPost.Id, true)
+			require.NoError(t, err)
+			require.ElementsMatch(t, []string{th.BasicUser.Id, th.BasicUser2.Id}, followers)
+
+			_, appErr = th.App.GetThreadMembershipForUser(removedUser.Id, rootPost.Id)
+			require.NotNil(t, appErr)
+		})
+
+		t.Run("repeating the removal reports not found and changes nothing", func(t *testing.T) {
+			countBefore, appErr := th.App.GetChannelMemberCount(th.Context, channel.Id)
+			require.Nil(t, appErr)
+
+			appErr = th.App.RemoveUserFromChannel(th.Context, removedUser.Id, th.BasicUser.Id, channel)
+			require.NotNil(t, appErr)
+			require.Equal(t, http.StatusNotFound, appErr.StatusCode)
+
+			countAfter, appErr := th.App.GetChannelMemberCount(th.Context, channel.Id)
+			require.Nil(t, appErr)
+			require.Equal(t, countBefore, countAfter)
+
+			followers, err := th.App.Srv().Store().Thread().GetThreadFollowers(rootPost.Id, true)
+			require.NoError(t, err)
+			require.ElementsMatch(t, []string{th.BasicUser.Id, th.BasicUser2.Id}, followers)
+		})
+
+		if !canReAdd {
+			return
+		}
+
+		t.Run("re-adding the user starts from clean thread state", func(t *testing.T) {
+			_, appErr := th.App.AddUserToChannel(th.Context, removedUser, channel, false)
+			require.Nil(t, appErr)
+
+			_, appErr = th.App.GetThreadMembershipForUser(removedUser.Id, rootPost.Id)
+			require.NotNil(t, appErr)
+			require.Equal(t, http.StatusNotFound, appErr.StatusCode)
+
+			threads, appErr := th.App.GetThreadsForUser(th.Context, removedUser.Id, th.BasicTeam.Id, model.GetUserThreadsOpts{})
+			require.Nil(t, appErr)
+			require.NotContains(t, threadIDs(threads), rootPost.Id)
+		})
+	}
+
+	t.Run("private channel", func(t *testing.T) {
+		privateChannel := th.CreatePrivateChannel(t, th.BasicTeam)
+		th.AddUserToChannel(t, th.BasicUser2, privateChannel)
+		th.AddUserToChannel(t, removedUser, privateChannel)
+
+		runScenario(t, privateChannel, true)
+	})
+
+	t.Run("group message", func(t *testing.T) {
+		groupChannel, appErr := th.App.CreateGroupChannel(th.Context, []string{th.BasicUser.Id, th.BasicUser2.Id, removedUser.Id}, th.BasicUser.Id)
+		require.Nil(t, appErr)
+
+		// Users cannot be re-added to a group message through AddUserToChannel.
+		runScenario(t, groupChannel, false)
+	})
 }

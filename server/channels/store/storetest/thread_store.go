@@ -29,6 +29,7 @@ func TestThreadStore(t *testing.T, rctx request.CTX, ss store.Store, s SqlStore)
 	t.Run("MarkAllAsReadByChannels", func(t *testing.T) { testMarkAllAsReadByChannels(t, rctx, ss) })
 	t.Run("MarkAllAsReadByTeam", func(t *testing.T) { testMarkAllAsReadByTeam(t, rctx, ss) })
 	t.Run("DeleteMembershipsForChannel", func(t *testing.T) { testDeleteMembershipsForChannel(t, rctx, ss) })
+	t.Run("ThreadQueriesRequireChannelMembership", func(t *testing.T) { testThreadQueriesRequireChannelMembership(t, rctx, ss) })
 	t.Run("SaveMultipleMemberships", func(t *testing.T) { testSaveMultipleMemberships(t, ss) })
 	t.Run("MaintainMultipleFromImport", func(t *testing.T) { testMaintainMultipleFromImport(t, rctx, ss) })
 	t.Run("UpdateTeamIdForChannelThreads", func(t *testing.T) { testUpdateTeamIdForChannelThreads(t, rctx, ss) })
@@ -924,6 +925,14 @@ func testVarious(t *testing.T, rctx request.CTX, ss store.Store) {
 		Name:        "gm" + model.NewId(),
 		Type:        model.ChannelTypeGroup,
 	}, -1)
+	require.NoError(t, err)
+	// GM threads are only visible to current channel members, exactly like
+	// team channel threads, so user1 needs a real membership row.
+	_, err = ss.Channel().SaveMember(rctx, &model.ChannelMember{
+		ChannelId:   gm1.Id,
+		UserId:      user1ID,
+		NotifyProps: model.GetDefaultChannelNotifyProps(),
+	})
 	require.NoError(t, err)
 
 	team1channel1post1, err := ss.Post().Save(rctx, &model.Post{
@@ -2211,5 +2220,150 @@ func testUpdateTeamIdForChannelThreads(t *testing.T, rctx request.CTX, ss store.
 		threads, err = ss.Thread().GetThreadsForUser(rctx, userA.Id, team1.Id, model.GetUserThreadsOpts{})
 		require.NoError(t, err)
 		require.Len(t, threads, 1)
+	})
+}
+
+// testThreadQueriesRequireChannelMembership proves that every user-facing
+// thread/unread query stops returning a thread as soon as the user's
+// ChannelMembers row is gone, regardless of whether any ThreadMemberships rows
+// survived. This is the read-side backstop for private channel *and* group
+// message removals: a stale thread membership must never let a removed user
+// infer activity from a conversation they can no longer access.
+func testThreadQueriesRequireChannelMembership(t *testing.T, rctx request.CTX, ss store.Store) {
+	removedUserID := model.NewId()
+	remainingUserID := model.NewId()
+	posterID := model.NewId()
+
+	team, err := ss.Team().Save(&model.Team{
+		DisplayName: "DisplayName",
+		Name:        "team" + model.NewId(),
+		Email:       MakeEmail(),
+		Type:        model.TeamOpen,
+	})
+	require.NoError(t, err)
+
+	privateChannel, err := ss.Channel().Save(rctx, &model.Channel{
+		TeamId:      team.Id,
+		DisplayName: "Private",
+		Name:        "private" + model.NewId(),
+		Type:        model.ChannelTypePrivate,
+	}, -1)
+	require.NoError(t, err)
+
+	groupChannel, err := ss.Channel().Save(rctx, &model.Channel{
+		DisplayName: "GM",
+		Name:        "gm" + model.NewId(),
+		Type:        model.ChannelTypeGroup,
+	}, -1)
+	require.NoError(t, err)
+
+	for _, channel := range []*model.Channel{privateChannel, groupChannel} {
+		for _, userID := range []string{removedUserID, remainingUserID, posterID} {
+			_, err = ss.Channel().SaveMember(rctx, &model.ChannelMember{
+				ChannelId:   channel.Id,
+				UserId:      userID,
+				NotifyProps: model.GetDefaultChannelNotifyProps(),
+			})
+			require.NoError(t, err)
+		}
+	}
+
+	createThread := func(channelID string) *model.Post {
+		t.Helper()
+		root, err := ss.Post().Save(rctx, &model.Post{
+			ChannelId: channelID,
+			UserId:    posterID,
+			Message:   model.NewRandomString(10),
+		})
+		require.NoError(t, err)
+		threadStoreCreateReply(t, rctx, ss, channelID, root.Id, posterID, model.GetMillis())
+		return root
+	}
+
+	follow := func(userID, postID string) {
+		t.Helper()
+		_, err := ss.Thread().MaintainMembership(userID, postID, store.ThreadMembershipOpts{
+			Following:         true,
+			IncrementMentions: true,
+			UpdateFollowing:   true,
+		})
+		require.NoError(t, err)
+	}
+
+	privateRoot := createThread(privateChannel.Id)
+	groupRoot := createThread(groupChannel.Id)
+	for _, userID := range []string{removedUserID, remainingUserID} {
+		follow(userID, privateRoot.Id)
+		follow(userID, groupRoot.Id)
+	}
+
+	threadIDs := func(threads []*model.ThreadResponse) []string {
+		ids := make([]string, 0, len(threads))
+		for _, thread := range threads {
+			ids = append(ids, thread.PostId)
+		}
+		return ids
+	}
+
+	assertSees := func(t *testing.T, userID string, expected []string) {
+		t.Helper()
+		threads, err := ss.Thread().GetThreadsForUser(rctx, userID, team.Id, model.GetUserThreadsOpts{})
+		require.NoError(t, err)
+		require.ElementsMatch(t, expected, threadIDs(threads))
+
+		total, err := ss.Thread().GetTotalThreads(userID, team.Id, model.GetUserThreadsOpts{})
+		require.NoError(t, err)
+		require.EqualValues(t, len(expected), total)
+
+		unread, err := ss.Thread().GetTotalUnreadThreads(userID, team.Id, model.GetUserThreadsOpts{})
+		require.NoError(t, err)
+		require.EqualValues(t, len(expected), unread)
+
+		mentions, err := ss.Thread().GetTotalUnreadMentions(userID, team.Id, model.GetUserThreadsOpts{})
+		require.NoError(t, err)
+		require.EqualValues(t, len(expected), mentions)
+	}
+
+	t.Run("both users see both threads while they are members", func(t *testing.T) {
+		assertSees(t, removedUserID, []string{privateRoot.Id, groupRoot.Id})
+		assertSees(t, remainingUserID, []string{privateRoot.Id, groupRoot.Id})
+	})
+
+	// Simulate the contradictory state this change guards against: the
+	// ChannelMembers row is gone but the ThreadMemberships rows survived.
+	err = ss.Channel().RemoveMember(rctx, privateChannel.Id, removedUserID)
+	require.NoError(t, err)
+
+	t.Run("private channel thread disappears for the removed user only", func(t *testing.T) {
+		assertSees(t, removedUserID, []string{groupRoot.Id})
+		assertSees(t, remainingUserID, []string{privateRoot.Id, groupRoot.Id})
+
+		teamsUnread, err := ss.Thread().GetTeamsUnreadForUser(removedUserID, []string{team.Id}, true)
+		require.NoError(t, err)
+		if unread, ok := teamsUnread[team.Id]; ok {
+			require.Zero(t, unread.ThreadCount)
+			require.Zero(t, unread.ThreadMentionCount)
+		}
+
+		teamsUnread, err = ss.Thread().GetTeamsUnreadForUser(remainingUserID, []string{team.Id}, true)
+		require.NoError(t, err)
+		require.EqualValues(t, 1, teamsUnread[team.Id].ThreadCount)
+		require.EqualValues(t, 1, teamsUnread[team.Id].ThreadMentionCount)
+	})
+
+	err = ss.Channel().RemoveMember(rctx, groupChannel.Id, removedUserID)
+	require.NoError(t, err)
+
+	t.Run("group message thread disappears for the removed user only", func(t *testing.T) {
+		assertSees(t, removedUserID, []string{})
+		assertSees(t, remainingUserID, []string{privateRoot.Id, groupRoot.Id})
+	})
+
+	t.Run("removing the same member again is a no-op", func(t *testing.T) {
+		require.NoError(t, ss.Channel().RemoveMember(rctx, groupChannel.Id, removedUserID))
+		require.NoError(t, ss.Thread().DeleteMembershipsForChannel(removedUserID, groupChannel.Id))
+		require.NoError(t, ss.Thread().DeleteMembershipsForChannel(removedUserID, groupChannel.Id))
+		assertSees(t, removedUserID, []string{})
+		assertSees(t, remainingUserID, []string{privateRoot.Id, groupRoot.Id})
 	})
 }

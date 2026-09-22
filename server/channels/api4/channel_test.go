@@ -8443,3 +8443,177 @@ func TestPatchChannelManagedCategory(t *testing.T) {
 		assert.False(t, exists, "managed category should be cleared")
 	})
 }
+
+// TestRemovedPrivateChannelMemberCannotObserveActivity proves that once a user is
+// removed from a private channel, every backend path agrees: post/thread/unread
+// HTTP endpoints deny them, their thread list no longer references the channel,
+// and websocket fanout for new activity skips their still-open connection while
+// the remaining member keeps receiving it.
+func TestRemovedPrivateChannelMemberCannotObserveActivity(t *testing.T) {
+	th := Setup(t).InitBasic(t)
+
+	th.App.UpdateConfig(func(cfg *model.Config) {
+		*cfg.ServiceSettings.ThreadAutoFollow = true
+		*cfg.ServiceSettings.CollapsedThreads = model.CollapsedThreadsDefaultOn
+	})
+
+	channel := th.BasicPrivateChannel // BasicUser and BasicUser2 are both members.
+	removedUser := th.BasicUser2
+
+	removedClient := th.CreateClient()
+	th.LoginBasic2WithClient(t, removedClient)
+
+	remainingWS := th.CreateConnectedWebSocketClient(t)
+	removedWS := th.CreateConnectedWebSocketClientWithClient(t, removedClient)
+
+	// Build a thread the removed user participates in.
+	rootPost, resp, err := th.Client.CreatePost(context.Background(), &model.Post{ChannelId: channel.Id, Message: "root"})
+	require.NoError(t, err)
+	CheckCreatedStatus(t, resp)
+	_, resp, err = removedClient.CreatePost(context.Background(), &model.Post{ChannelId: channel.Id, RootId: rootPost.Id, Message: "reply from soon-to-be-removed user"})
+	require.NoError(t, err)
+	CheckCreatedStatus(t, resp)
+
+	// Preconditions: the user can see everything as a member.
+	_, resp, err = removedClient.GetUserThread(context.Background(), removedUser.Id, th.BasicTeam.Id, rootPost.Id, false)
+	require.NoError(t, err)
+	CheckOKStatus(t, resp)
+	_, resp, err = removedClient.GetPostThread(context.Background(), rootPost.Id, "", true)
+	require.NoError(t, err)
+	CheckOKStatus(t, resp)
+	_, resp, err = removedClient.GetChannelUnread(context.Background(), channel.Id, removedUser.Id)
+	require.NoError(t, err)
+	CheckOKStatus(t, resp)
+
+	// Drain any events queued so far so the assertions below only see new activity.
+	drain := func(ws *model.WebSocketClient) {
+		for {
+			select {
+			case <-ws.EventChannel:
+			case <-time.After(500 * time.Millisecond):
+				return
+			}
+		}
+	}
+
+	resp, err = th.Client.RemoveUserFromChannel(context.Background(), channel.Id, removedUser.Id)
+	require.NoError(t, err)
+	CheckOKStatus(t, resp)
+
+	// The removed user is told about their own removal, and nothing else.
+	func() {
+		for {
+			select {
+			case ev := <-removedWS.EventChannel:
+				if ev.EventType() == model.WebsocketEventUserRemoved && ev.GetData()["channel_id"] == channel.Id {
+					return
+				}
+			case <-time.After(5 * time.Second):
+				require.Fail(t, "removed user should have received the user_removed event")
+				return
+			}
+		}
+	}()
+	drain(remainingWS)
+	drain(removedWS)
+
+	t.Run("http paths deny the removed user", func(t *testing.T) {
+		_, resp, err := removedClient.GetUserThread(context.Background(), removedUser.Id, th.BasicTeam.Id, rootPost.Id, false)
+		require.Error(t, err)
+		CheckForbiddenStatus(t, resp)
+
+		_, resp, err = removedClient.GetPostThread(context.Background(), rootPost.Id, "", true)
+		require.Error(t, err)
+		CheckForbiddenStatus(t, resp)
+
+		_, resp, err = removedClient.GetPost(context.Background(), rootPost.Id, "")
+		require.Error(t, err)
+		CheckForbiddenStatus(t, resp)
+
+		_, resp, err = removedClient.GetPostsForChannel(context.Background(), channel.Id, 0, 60, "", true, false)
+		require.Error(t, err)
+		CheckForbiddenStatus(t, resp)
+
+		_, resp, err = removedClient.GetChannelUnread(context.Background(), channel.Id, removedUser.Id)
+		require.Error(t, err)
+		CheckForbiddenStatus(t, resp)
+
+		_, resp, err = removedClient.UpdateThreadReadForUser(context.Background(), removedUser.Id, th.BasicTeam.Id, rootPost.Id, model.GetMillis())
+		require.Error(t, err)
+		CheckForbiddenStatus(t, resp)
+
+		threads, _, err := removedClient.GetUserThreads(context.Background(), removedUser.Id, th.BasicTeam.Id, model.GetUserThreadsOpts{})
+		require.NoError(t, err)
+		for _, thread := range threads.Threads {
+			require.NotEqual(t, rootPost.Id, thread.PostId, "removed user must not see the private channel thread")
+		}
+	})
+
+	t.Run("repeated removal is rejected without changing state", func(t *testing.T) {
+		resp, err := th.Client.RemoveUserFromChannel(context.Background(), channel.Id, removedUser.Id)
+		require.Error(t, err)
+		CheckNotFoundStatus(t, resp)
+
+		members, _, err := th.Client.GetChannelMembers(context.Background(), channel.Id, 0, 100, "")
+		require.NoError(t, err)
+		require.Len(t, members, 1)
+		require.Equal(t, th.BasicUser.Id, members[0].UserId)
+	})
+
+	t.Run("websocket fanout skips the removed user's live connection", func(t *testing.T) {
+		reply, resp, err := th.Client.CreatePost(context.Background(), &model.Post{ChannelId: channel.Id, RootId: rootPost.Id, Message: "reply after removal"})
+		require.NoError(t, err)
+		CheckCreatedStatus(t, resp)
+
+		mentionsChannel := func(ev *model.WebSocketEvent) bool {
+			if ev.GetBroadcast().ChannelId == channel.Id {
+				return true
+			}
+			for _, key := range []string{"post", "thread"} {
+				if payload, ok := ev.GetData()[key].(string); ok && strings.Contains(payload, channel.Id) {
+					return true
+				}
+			}
+			return false
+		}
+
+		// The remaining member receives the new post.
+		func() {
+			for {
+				select {
+				case ev := <-remainingWS.EventChannel:
+					if ev.EventType() == model.WebsocketEventPosted && mentionsChannel(ev) {
+						var post model.Post
+						require.NoError(t, json.Unmarshal([]byte(ev.GetData()["post"].(string)), &post))
+						require.Equal(t, reply.Id, post.Id)
+						return
+					}
+				case <-time.After(5 * time.Second):
+					require.Fail(t, "remaining member should have received the posted event")
+					return
+				}
+			}
+		}()
+
+		// The removed user, whose websocket is still connected, receives nothing
+		// about the private channel.
+		func() {
+			for {
+				select {
+				case ev := <-removedWS.EventChannel:
+					require.Falsef(t, mentionsChannel(ev), "removed user received %s event for the private channel", ev.EventType())
+				case <-time.After(2 * time.Second):
+					return
+				}
+			}
+		}()
+
+		// The remaining member's thread state is intact and reflects the new reply.
+		thread, _, err := th.Client.GetUserThread(context.Background(), th.BasicUser.Id, th.BasicTeam.Id, rootPost.Id, false)
+		require.NoError(t, err)
+		require.EqualValues(t, 2, thread.ReplyCount)
+	})
+
+	removedWS.Close()
+	remainingWS.Close()
+}
